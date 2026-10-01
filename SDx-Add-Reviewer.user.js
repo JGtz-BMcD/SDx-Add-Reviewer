@@ -2,6 +2,7 @@
 // @name         Reviewer Wizard
 // @namespace    https://burnsmcd.com
 // @version      1.2
+// @author       Josue Gutierrez
 // @description  Per-project reviewer wizard for SDx: fast fuzzy search, favorites, existing-recipient awareness, and batched bulk add.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*

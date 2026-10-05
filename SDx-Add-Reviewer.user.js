@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Reviewer Wizard
 // @namespace    https://burnsmcd.com
-// @version      1.2
+// @version      1.3
 // @author       Josue Gutierrez
-// @description  Per-project reviewer wizard for SDx: fast fuzzy search, favorites, existing-recipient awareness, and batched bulk add.
+// @description  Per-project reviewer wizard for SDx: fast fuzzy search, favorites, existing-recipient awareness, batched bulk add, and batch add to multiple To Do List documents.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
 // @grant        none
@@ -12,16 +12,16 @@
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.2";
+    const VERSION = "1.3";
     const TOOL_NAME = "Reviewer Wizard";
     const WIZARD_ICON = "\u{1FA84}"; // magic wand
     const PAGE_SIZE = 100;
     const DEFAULT_SELECTED_ORGS = ["Burns & McDonnell"];
     const IDS = {
-        style: "sdxbr_style_v12",
-        button: "sdxbr_button_v12",
-        modal: "sdxbr_modal_v12",
-        backdrop: "sdxbr_backdrop_v12"
+        style: "sdxbr_style_v13",
+        button: "sdxbr_button_v13",
+        modal: "sdxbr_modal_v13",
+        backdrop: "sdxbr_backdrop_v13"
     };
     // Storage keys are unchanged from v0.7 on purpose - this release is UI/perf
     // tweaks only, so existing per-project databases, favorites, and recents all
@@ -33,8 +33,11 @@
         userCachePrefix: "sdxbr_user_cache_v07_",
         orgIndexPrefix: "sdxbr_org_index_v07_",
         selectedOrgsPrefix: "sdxbr_selected_orgs_v07_",
-        pageContextPrefix: "sdxbr_page_context_v07_"
+        pageContextPrefix: "sdxbr_page_context_v07_",
+        lastAddTemplatePrefix: "sdxbr_last_add_template_v13_"
     };
+    const BATCH_BTN_ID = "sdxbr_batch_button_v13";
+    const TODO_CHECKBOX_SELECTOR = 'input[type="checkbox"].mdc-checkbox__native-control';
     const state = {
         hooksInstalled: false,
         lastHref: "",
@@ -65,7 +68,18 @@
         authHeaders: {},
         authStale: false,
         busy: false,
-        dbBusy: false
+        dbBusy: false,
+        // Batch mode (To Do List): add the same reviewers to several selected
+        // workflow steps at once. `existing` is docId -> { status, users }.
+        batch: {
+            active: false,
+            docs: [],
+            existing: new Map(),
+            results: null,
+            detailsOpen: false,
+            selection: [],
+            lastChecked: -1
+        }
     };
     /************************************************************
      * Utilities
@@ -431,6 +445,73 @@
     function persistAuthHeaders() {
         writeJson(STORE.authHeaders, state.authHeaders);
     }
+    // ---- Token freshness (ported from SDx QoL) ----
+    // SDx renews its session token while you work and the renewed one isn't
+    // always the one we captured first. Compare JWT expiry so a stale token is
+    // never preferred over a newer one, and fall back to sessionStorage when the
+    // captured token has expired.
+    function stripBearer(value) {
+        return String(value || "").replace(/^Bearer\s+/i, "").trim();
+    }
+    function looksLikeJwt(value) {
+        return typeof value === "string" && value.split(".").length === 3;
+    }
+    function jwtExpiryMs(token) {
+        try {
+            const part = String(token).split(".")[1];
+            const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+            const json = atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, "="));
+            const exp = Number(JSON.parse(json).exp);
+            return Number.isFinite(exp) ? exp * 1000 : 0;
+        } catch {
+            return 0;
+        }
+    }
+    function getSessionStorageTokens() {
+        const found = [];
+        try {
+            for (let i = 0; i < sessionStorage.length; i++) {
+                const key = sessionStorage.key(i);
+                if (!key || !/auth/i.test(key)) continue;
+                const raw = sessionStorage.getItem(key);
+                if (!raw) continue;
+                try {
+                    const parsed = JSON.parse(raw);
+                    const candidate = parsed && (parsed.authorization || parsed.Authorization || parsed.accessToken || parsed.access_token || parsed.token);
+                    if (typeof candidate === "string") {
+                        const stripped = stripBearer(candidate);
+                        if (looksLikeJwt(stripped)) found.push(stripped);
+                    }
+                } catch {
+                    const stripped = stripBearer(raw);
+                    if (looksLikeJwt(stripped)) found.push(stripped);
+                }
+            }
+        } catch {}
+        return found;
+    }
+    // Returns "Bearer <token>". Normal use: keep the captured token unless it is
+    // missing/expired. forceFreshest (used on a 401 retry): latest expiry wins.
+    function getBestAuthorization(forceFreshest = false) {
+        const captured = stripBearer(state.authHeaders.authorization);
+        const all = [captured, ...getSessionStorageTokens()].filter(Boolean);
+        if (!all.length) return "";
+        const now = Date.now();
+        if (!forceFreshest && captured) {
+            const exp = jwtExpiryMs(captured);
+            if (exp === 0 || exp > now + 30000) return "Bearer " + captured;
+        }
+        let best = all[0];
+        let bestExp = jwtExpiryMs(best);
+        for (const token of all) {
+            const exp = jwtExpiryMs(token);
+            if (exp > bestExp) {
+                best = token;
+                bestExp = exp;
+            }
+        }
+        return "Bearer " + best;
+    }
     // Broadened on purpose: rather than only watching the endpoints this tool calls
     // directly, grab the bearer token off of ANY same-origin SDx API call the
     // native app makes. In practice, almost any click inside SDx keeps the
@@ -448,8 +529,14 @@
         const h = headersToObject(headers);
         let changed = false;
         if (h.authorization && h.authorization !== state.authHeaders.authorization) {
-            state.authHeaders.authorization = h.authorization;
-            changed = true;
+            // Only replace the stored token with one that expires at least as
+            // late (an unreadable expiry counts as 0, so it never beats a good one).
+            const newExp = jwtExpiryMs(stripBearer(h.authorization));
+            const oldExp = jwtExpiryMs(stripBearer(state.authHeaders.authorization));
+            if (!state.authHeaders.authorization || newExp >= oldExp) {
+                state.authHeaders.authorization = h.authorization;
+                changed = true;
+            }
         }
         if (h.accept) state.authHeaders.accept = h.accept;
         if (h["accept-language"]) state.authHeaders["accept-language"] = h["accept-language"];
@@ -467,8 +554,9 @@
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json"
         };
-        if (state.authHeaders.authorization) {
-            headers.authorization = state.authHeaders.authorization;
+        const bestAuth = getBestAuthorization();
+        if (bestAuth) {
+            headers.authorization = bestAuth;
         }
         if (state.authHeaders["accept-language"]) {
             headers["accept-language"] = state.authHeaders["accept-language"];
@@ -486,7 +574,18 @@
     // If SDx comes back with 401/403 the captured token is stale - mark it,
     // surface it in the UI, and stop instead of failing silently.
     async function apiFetch(url, options) {
-        const response = await fetch(url, options);
+        let response = await fetch(url, options);
+        if (response.status === 401) {
+            // Token may simply be stale: retry once with the freshest one we can see.
+            const fresh = getBestAuthorization(true);
+            const used = options?.headers?.authorization || "";
+            if (fresh && fresh !== used) {
+                response = await fetch(url, {
+                    ...options,
+                    headers: { ...(options?.headers || {}), authorization: fresh }
+                });
+            }
+        }
         if (response.status === 401 || response.status === 403) {
             state.authStale = true;
             updateSessionIndicator();
@@ -591,6 +690,13 @@
                     ...parsed,
                     userOBIDs: []
                 };
+                // Remember the workflow fields per project so batch mode (which
+                // has no single document page to read them from) can reuse them.
+                writeJson(storeKey(STORE.lastAddTemplatePrefix), {
+                    workFlowTemplateName: parsed.workFlowTemplateName || "",
+                    stepDefName: parsed.stepDefName || "",
+                    relDefUID: parsed.relDefUID || ""
+                });
             }
             savePageContext();
             renderContextPanel();
@@ -601,9 +707,9 @@
         }
     }
     function installNetworkHooks() {
-        if (state.hooksInstalled || window.__sdxbr_v12_hooks) return;
+        if (state.hooksInstalled || window.__sdxbr_v13_hooks) return;
         state.hooksInstalled = true;
-        window.__sdxbr_v12_hooks = true;
+        window.__sdxbr_v13_hooks = true;
         const originalFetch = window.fetch;
         window.fetch = async function (...args) {
             const info = getFetchInfo(args);
@@ -627,21 +733,21 @@
         const originalSend = XMLHttpRequest.prototype.send;
         const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
         XMLHttpRequest.prototype.open = function (method, url) {
-            this.__sdxbr_v12_url = url;
-            this.__sdxbr_v12_headers = {};
+            this.__sdxbr_v13_url = url;
+            this.__sdxbr_v13_headers = {};
             return originalOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.setRequestHeader = function (key, value) {
             try {
-                this.__sdxbr_v12_headers[String(key).toLowerCase()] = value;
+                this.__sdxbr_v13_headers[String(key).toLowerCase()] = value;
             } catch {}
             return originalSetHeader.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function (body) {
             try {
-                const url = this.__sdxbr_v12_url || "";
+                const url = this.__sdxbr_v13_url || "";
                 if (isCandidateSdxApiUrl(url)) {
-                    rememberHeaders(this.__sdxbr_v12_headers);
+                    rememberHeaders(this.__sdxbr_v13_headers);
                 }
                 const lower = String(url).toLowerCase();
                 if (lower.includes("/api/v2/sda/getusersforworkflowsteps")) {
@@ -874,6 +980,7 @@
         return inner;
     }
     async function loadExistingRecipients() {
+        if (state.batch.active) return loadBatchExisting(true);
         if (!state.documentOBID) return;
         state.existingRecipientsStatus = "loading";
         renderExistingRecipients();
@@ -988,7 +1095,9 @@
         const user = state.userCache.get(id) || resolveUserById(id);
         if (!user) return;
         if (state.existingRecipients.has(id)) {
-            setStatus(`${getUserName(user)} is already a recipient on this document.`, true);
+            setStatus(state.batch.active
+                ? `${getUserName(user)} is already on every included document.`
+                : `${getUserName(user)} is already a recipient on this document.`, true);
             return;
         }
         if (state.addedThisPage.has(id)) {
@@ -1037,6 +1146,7 @@
     }
     async function addQueuedReviewers() {
         if (state.busy) return;
+        if (state.batch.active) return addQueuedReviewersBatch();
         const users = Array.from(state.queued.values());
         if (!users.length) {
             setStatus("No reviewers queued.", true);
@@ -1100,9 +1210,9 @@
             renderAll();
         }
     }
-    function buildAddRecipientsPayload(userOBIDs) {
+    function buildAddRecipientsPayload(userOBIDs, stepOBIDs) {
         return {
-            workFlowStepOBIDs: state.addTemplate.workFlowStepOBIDs,
+            workFlowStepOBIDs: stepOBIDs || state.addTemplate.workFlowStepOBIDs,
             userOBIDs,
             workFlowTemplateName: state.addTemplate.workFlowTemplateName || "HEX QA Append Reviewer Workflow",
             stepDefName: state.addTemplate.stepDefName || "SCLBProjComsPerformReview",
@@ -1138,6 +1248,529 @@
             throw new Error(`Batch add of ${users.length} reviewer(s) failed: ${response.status} ${response.statusText} ${text}`);
         }
         return true;
+    }
+    /************************************************************
+     * Batch mode (To Do List): add the same reviewers to many documents
+     ************************************************************/
+    // Confirmed from a live To Do row: each row is an SPFWorkflowStep whose OBID
+    // is exactly the ContextObjectOBIDs value of that row's native Add Recipient
+    // URL, i.e. the workFlowStepOBIDs AddRecipients expects. The project comes
+    // from the row's DynWorkflowItemConfig (the row's own Config is null).
+    function isTodoListPage() {
+        return /todo-list/i.test(location.hash) || /todo-list/i.test(location.href);
+    }
+    function getCheckedTodoBoxes() {
+        return Array.from(document.querySelectorAll(TODO_CHECKBOX_SELECTOR)).filter(cb => cb.checked && !cb.disabled);
+    }
+    function collectTodoSelection() {
+        const docs = [];
+        const seen = new Set();
+        const jq = window.jQuery || window.$;
+        if (!jq) return docs;
+        for (const cb of getCheckedTodoBoxes()) {
+            const gridEl = cb.closest(".k-grid");
+            if (!gridEl) continue;
+            const widget = jq(gridEl).data("kendoGrid");
+            if (!widget || typeof widget.dataItem !== "function") continue;
+            const row = cb.closest('tr, [role="row"], [role="none"]');
+            if (!row) continue;
+            let item = null;
+            try { item = widget.dataItem(row); } catch {}
+            if (!item) {
+                const uid = row.getAttribute("data-uid");
+                const twin = uid ? gridEl.querySelector(`[data-uid="${uid}"][role="row"]`) : null;
+                if (twin) {
+                    try { item = widget.dataItem(twin); } catch {}
+                }
+            }
+            if (!item || !item.OBID) continue;
+            if (item.Class && item.Class !== "SPFWorkflowStep") continue;
+            if (seen.has(item.OBID)) continue;
+            seen.add(item.OBID);
+            docs.push({
+                id: item.OBID,
+                name: String(item.CI_WorkflowItem || item.DynWorkflowItemName || item.OBID).trim(),
+                desc: String(item.CI_bmcdWorkflowItemDesc || "").trim(),
+                step: String(item.Name || item.CI_Name || "").trim(),
+                reason: String(item.CI_ReasonForReceipt || "").trim(),
+                workflow: String(item.CI_WorkflowName || "").trim(),
+                project: String(item.DynWorkflowItemConfig || item.Config || "").trim()
+            });
+        }
+        return docs;
+    }
+    // AddRecipients is the Consolidation step's "Add Reviewer" action, so rows
+    // for any other step start unchecked in the batch window (user can opt in).
+    function isConsolidationDoc(doc) {
+        return /consolidation/i.test(`${doc.reason} ${doc.step}`);
+    }
+    function refreshBatchSelection(force) {
+        const n = getCheckedTodoBoxes().length;
+        if (!force && n === state.batch.lastChecked) return;
+        state.batch.lastChecked = n;
+        state.batch.selection = n ? collectTodoSelection() : [];
+    }
+    function removeBatchButton() {
+        document.getElementById(BATCH_BTN_ID)?.remove();
+    }
+    function findBatchAnchor() {
+        for (const id of ["sdx-qol-dl-files-btn", "sdx-qol-manager-button"]) {
+            const el = document.getElementById(id);
+            if (el && el.isConnected) return { el, append: false };
+        }
+        const exportEl = Array.from(document.querySelectorAll("button, a, span"))
+            .find(el => /^export all to excel$/i.test(String(el.textContent || "").replace(/\s+/g, " ").trim()));
+        if (exportEl) return { el: exportEl.closest("button, a") || exportEl, append: false };
+        const toolbar = document.querySelector('[role="toolbar"], .toolbar, .command-bar, .mat-toolbar, .k-toolbar');
+        return toolbar ? { el: toolbar, append: true } : null;
+    }
+    function ensureBatchButton() {
+        if (!isTodoListPage()) {
+            removeBatchButton();
+            state.batch.lastChecked = -1;
+            return;
+        }
+        if (state.batch.active && isModalOpen()) return;
+        refreshBatchSelection(false);
+        const count = state.batch.selection.length;
+        let btn = document.getElementById(BATCH_BTN_ID);
+        if (count < 1) {
+            btn?.remove();
+            return;
+        }
+        if (!btn || !btn.isConnected) {
+            const anchor = findBatchAnchor();
+            if (!anchor) return;
+            btn = document.createElement("button");
+            btn.id = BATCH_BTN_ID;
+            btn.type = "button";
+            btn.className = "sdxbr-batch-btn";
+            btn.addEventListener("click", e => {
+                e.preventDefault();
+                e.stopPropagation();
+                openBatchModal();
+            }, true);
+            if (anchor.append) anchor.el.appendChild(btn);
+            else anchor.el.insertAdjacentElement("afterend", btn);
+        }
+        btn.textContent = count === 1
+            ? `${WIZARD_ICON} Add reviewers`
+            : `${WIZARD_ICON} Batch add reviewers (${count})`;
+        btn.title = count === 1
+            ? "Add reviewers to the selected document"
+            : "Add the same reviewers to every selected document";
+    }
+    function includedBatchDocs() {
+        return state.batch.docs.filter(d => d.include);
+    }
+    function applyBatchContext() {
+        const ids = includedBatchDocs().map(d => d.id);
+        state.addTemplate.workFlowStepOBIDs = ids;
+        state.documentOBID = ids[0] || null;
+        state.addEndpoint = location.origin + "/ENR01Server/api/v2/SDA/AddRecipients";
+        const saved = readJson(storeKey(STORE.lastAddTemplatePrefix), null);
+        if (saved) {
+            for (const key of ["workFlowTemplateName", "stepDefName", "relDefUID"]) {
+                if (saved[key]) state.addTemplate[key] = saved[key];
+            }
+        }
+    }
+    function openBatchModal() {
+        refreshBatchSelection(true);
+        const selection = state.batch.selection;
+        if (!selection.length) {
+            alert("Reviewer Wizard: couldn't read any selected rows. Re-select the documents and try again.");
+            return;
+        }
+        const projects = Array.from(new Set(selection.map(d => d.project)));
+        if (projects.length !== 1 || !projects[0]) {
+            alert(
+                projects.length > 1
+                    ? `Reviewer Wizard: your selection spans more than one project (${projects.filter(Boolean).join(", ")}). Reviewer lists are kept per project, so select documents from one project at a time.`
+                    : "Reviewer Wizard: couldn't determine the project for the selected documents."
+            );
+            return;
+        }
+        state.batch.active = true;
+        state.batch.docs = selection.map(d => ({ ...d, include: isConsolidationDoc(d) }));
+        state.batch.existing = new Map();
+        state.batch.results = null;
+        state.projectKey = projects[0];
+        loadProjectScopedState();
+        loadAuthHeaders();
+        resetPerDocumentPage();
+        applyBatchContext();
+        installModal();
+        document.getElementById(IDS.backdrop)?.classList.add("open");
+        document.getElementById(IDS.modal)?.classList.add("open");
+        switchTab("reviewers");
+        updateStatus();
+        updateSessionIndicator();
+        loadBatchExisting(false);
+    }
+    async function loadBatchDocExisting(doc, map) {
+        const entry = { status: "loading", users: new Map() };
+        map.set(doc.id, entry);
+        try {
+            const details = await fetchDocumentReviewDetails(doc.id);
+            for (const u of [...(details.Users || []), ...(details.RecipientsWithNoReviews || [])]) {
+                if (u && u.OBID) entry.users.set(u.OBID, u);
+            }
+            entry.status = "ready";
+        } catch (e) {
+            warn(`Failed to load reviewers for ${doc.name}:`, e);
+            entry.status = e instanceof AuthError ? "auth" : "error";
+            entry.error = e;
+        }
+    }
+    // Fetches each included document's current reviewers (4 at a time). With
+    // force=false only documents not already loaded are fetched.
+    async function loadBatchExisting(force) {
+        if (!state.batch.active) return;
+        const map = state.batch.existing;
+        const docs = includedBatchDocs().filter(d => force || map.get(d.id)?.status !== "ready");
+        if (!docs.length) {
+            recomputeBatchExisting();
+            renderBatchDependents();
+            return;
+        }
+        docs.forEach(d => map.set(d.id, { status: "loading", users: new Map() }));
+        recomputeBatchExisting();
+        renderExistingRecipients();
+        let next = 0;
+        const worker = async () => {
+            while (next < docs.length) {
+                const doc = docs[next++];
+                await loadBatchDocExisting(doc, map);
+                if (!state.batch.active || state.batch.existing !== map) return;
+                recomputeBatchExisting();
+                renderExistingRecipients();
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(4, docs.length) }, worker));
+        if (!state.batch.active || state.batch.existing !== map) return;
+        recomputeBatchExisting();
+        renderBatchDependents();
+    }
+    // state.existingRecipients doubles as "on EVERY included document" in batch
+    // mode, so the existing Queue/Search/Favorites "On Document" logic just works.
+    function recomputeBatchExisting() {
+        if (!state.batch.active) return;
+        const included = includedBatchDocs();
+        const entries = included.map(d => state.batch.existing.get(d.id));
+        state.existingRecipients = new Map();
+        const anyLoading = entries.some(e => !e || e.status === "loading");
+        const anyAuth = entries.some(e => e && e.status === "auth");
+        const anyError = entries.some(e => e && e.status === "error");
+        if (!included.length) state.existingRecipientsStatus = "idle";
+        else if (anyLoading) state.existingRecipientsStatus = "loading";
+        else if (anyAuth) state.existingRecipientsStatus = "auth";
+        else if (anyError) state.existingRecipientsStatus = "error";
+        else state.existingRecipientsStatus = "ready";
+        if (state.existingRecipientsStatus === "ready") {
+            for (const [id, user] of entries[0].users) {
+                if (entries.every(e => e.users.has(id))) state.existingRecipients.set(id, user);
+            }
+        }
+    }
+    // People already on SOME (not all) included documents, with which documents.
+    function getBatchPartialRecipients() {
+        const included = includedBatchDocs();
+        const counts = new Map();
+        for (const doc of included) {
+            const entry = state.batch.existing.get(doc.id);
+            if (!entry || entry.status !== "ready") continue;
+            for (const [id, user] of entry.users) {
+                if (!counts.has(id)) counts.set(id, { user, docs: [] });
+                counts.get(id).docs.push(doc);
+            }
+        }
+        return Array.from(counts.values())
+            .filter(c => c.docs.length < included.length)
+            .sort((a, b) => String(a.user.DisplayName || "").localeCompare(String(b.user.DisplayName || "")));
+    }
+    function renderBatchDependents() {
+        updateModalHeader();
+        renderExistingRecipients();
+        renderResults();
+        renderQueue();
+        renderFavorites();
+        renderRecents();
+    }
+    async function postAddRecipients(stepIds, userIds) {
+        const payload = buildAddRecipientsPayload(userIds, stepIds);
+        const response = await apiFetch(state.addEndpoint, {
+            method: "POST",
+            headers: getApiHeaders(),
+            credentials: "include",
+            mode: "cors",
+            body: JSON.stringify(payload)
+        });
+        const text = await response.text();
+        if (!response.ok) {
+            throw new Error(`AddRecipients failed for ${stepIds.length} document(s): ${response.status} ${response.statusText} ${text}`);
+        }
+        return true;
+    }
+    // Fallback used when a multi-document request is rejected. Re-reads what is
+    // on the document first, in case the earlier request partly applied, so
+    // nobody is added twice. Returns true if the session expired.
+    async function addToSingleBatchDoc(doc, users, result) {
+        await loadBatchDocExisting(doc, state.batch.existing);
+        const entry = state.batch.existing.get(doc.id);
+        if (!entry || entry.status !== "ready") {
+            const error = entry?.error || new Error("Could not re-check current reviewers");
+            result.failed.push(...users.map(user => ({ user, error })));
+            return error instanceof AuthError;
+        }
+        result.added.push(...users.filter(u => entry.users.has(u.Id)));
+        const need = users.filter(u => !entry.users.has(u.Id));
+        if (!need.length) return false;
+        try {
+            await postAddRecipients([doc.id], need.map(getUserId));
+            result.added.push(...need);
+            return false;
+        } catch (e) {
+            err(e);
+            if (e instanceof AuthError) {
+                result.failed.push(...need.map(user => ({ user, error: e })));
+                return true;
+            }
+        }
+        for (const user of need) {
+            try {
+                await postAddRecipients([doc.id], [getUserId(user)]);
+                result.added.push(user);
+            } catch (e) {
+                err(e);
+                result.failed.push({ user, error: e });
+                if (e instanceof AuthError) return true;
+            }
+            await sleep(75);
+        }
+        return false;
+    }
+    async function addQueuedReviewersBatch() {
+        const users = Array.from(state.queued.values());
+        if (!users.length) {
+            setStatus("No reviewers queued.", true);
+            return;
+        }
+        const docs = includedBatchDocs();
+        if (!docs.length) {
+            setStatus("No documents are included. Tick at least one document above.", true);
+            return;
+        }
+        state.busy = true;
+        setReviewerBusy(true);
+        const map = state.batch.existing;
+        const results = new Map(docs.map(d => [d.id, { doc: d, added: [], skipped: [], failed: [] }]));
+        let stoppedForAuth = false;
+        try {
+            // Always start from a fresh snapshot so nobody is added twice.
+            setStatus(`Checking current reviewers on ${docs.length} document(s)...`);
+            await loadBatchExisting(true);
+            const plan = [];
+            for (const doc of docs) {
+                const result = results.get(doc.id);
+                const entry = map.get(doc.id);
+                if (!entry || entry.status !== "ready") {
+                    const error = entry?.error || new Error("Could not read current reviewers for this document");
+                    result.failed.push(...users.map(user => ({ user, error })));
+                    if (error instanceof AuthError) stoppedForAuth = true;
+                    continue;
+                }
+                result.skipped = users.filter(u => entry.users.has(u.Id));
+                const need = users.filter(u => !entry.users.has(u.Id));
+                if (need.length) plan.push({ doc, users: need });
+            }
+            // Documents needing the exact same people share one request.
+            const groups = new Map();
+            for (const p of plan) {
+                const key = p.users.map(u => u.Id).sort().join("|");
+                if (!groups.has(key)) groups.set(key, { users: p.users, docs: [] });
+                groups.get(key).docs.push(p.doc);
+            }
+            let groupNo = 0;
+            for (const group of groups.values()) {
+                if (stoppedForAuth) break;
+                groupNo++;
+                setStatus(`Adding ${group.users.length} reviewer(s) to ${group.docs.length} document(s) (request ${groupNo} of ${groups.size})...`);
+                try {
+                    await postAddRecipients(group.docs.map(d => d.id), group.users.map(getUserId));
+                    for (const doc of group.docs) results.get(doc.id).added.push(...group.users);
+                } catch (e) {
+                    err(e);
+                    if (e instanceof AuthError) {
+                        stoppedForAuth = true;
+                        for (const doc of group.docs) results.get(doc.id).failed.push(...group.users.map(user => ({ user, error: e })));
+                        break;
+                    }
+                    setStatus("SDx didn't accept the multi-document request - adding one document at a time...", true);
+                    for (const doc of group.docs) {
+                        if (stoppedForAuth) break;
+                        stoppedForAuth = await addToSingleBatchDoc(doc, group.users, results.get(doc.id));
+                    }
+                }
+                await sleep(75);
+            }
+            // Anything never attempted (session expired mid-run) counts as failed.
+            const authError = new AuthError("Not attempted - session expired.");
+            for (const p of plan) {
+                const r = results.get(p.doc.id);
+                if (!r.added.length && !r.failed.length) r.failed.push(...p.users.map(user => ({ user, error: authError })));
+            }
+            state.batch.results = Array.from(results.values());
+            const failedIds = new Set();
+            let addedCount = 0;
+            for (const r of state.batch.results) {
+                addedCount += r.added.length;
+                r.failed.forEach(f => failedIds.add(f.user.Id));
+            }
+            for (const user of users) {
+                if (!failedIds.has(user.Id)) {
+                    state.queued.delete(user.Id);
+                    state.addedThisPage.set(user.Id, user);
+                }
+                if (state.batch.results.some(r => r.added.some(a => a.Id === user.Id))) saveRecent(user);
+            }
+            const failedDocs = state.batch.results.filter(r => r.failed.length).length;
+            if (stoppedForAuth) {
+                setStatus(`Stopped: SDx session expired. Click a filter/search in SDx, then press Add again to finish the rest.`, true);
+            } else if (!failedDocs) {
+                setStatus(`Done. ${addedCount} reviewer assignment(s) added across ${docs.length} document(s).`);
+            } else {
+                setStatus(`Partial: ${failedDocs} of ${docs.length} document(s) had failures. Fix and press Add again - already-added reviewers are skipped.`, true);
+            }
+            if (addedCount) state.showRefreshPrompt = true;
+        } finally {
+            state.busy = false;
+            setReviewerBusy(false);
+            renderAll();
+        }
+        if (state.batch.active) loadBatchExisting(true);
+    }
+    function renderBatchPanel(container, statusEl) {
+        const docs = state.batch.docs;
+        const included = includedBatchDocs();
+        const statusText = {
+            idle: "Nothing included.",
+            loading: "Loading current reviewers...",
+            auth: "Session expired - click a filter in SDx, then Refresh.",
+            error: "Couldn't load reviewers for some documents. Click Refresh.",
+            ready: "Reviewers loaded."
+        }[state.existingRecipientsStatus] || "";
+        if (statusEl) statusEl.textContent = `${included.length} of ${docs.length} included. ${statusText}`;
+        const chip = u => `<span class="sdxbr-chip" title="OBID: ${escapeHtml(u.OBID)}">${escapeHtml(u.DisplayName || u.OBID)}</span>`;
+        const everyone = Array.from(state.existingRecipients.values())
+            .sort((a, b) => String(a.DisplayName || "").localeCompare(String(b.DisplayName || "")));
+        const ready = state.existingRecipientsStatus === "ready";
+        const partial = ready ? getBatchPartialRecipients() : [];
+        const skippedNote = docs.some(d => !isConsolidationDoc(d))
+            ? `<div class="sdxbr-muted" style="margin-bottom:6px;">Rows that aren't a Consolidation step start unchecked, since Add Reviewer is a Consolidation action. Tick them to include anyway.</div>`
+            : "";
+        const docRows = docs.map(d => {
+            const entry = state.batch.existing.get(d.id);
+            const names = entry && entry.status === "ready"
+                ? Array.from(entry.users.values()).map(u => u.DisplayName || u.OBID).sort().join(", ")
+                : "";
+            const count = !d.include ? "not included"
+                : !entry || entry.status === "loading" ? "loading..."
+                : entry.status === "ready" ? `${entry.users.size} reviewer${entry.users.size === 1 ? "" : "s"}`
+                : "couldn't load";
+            return `
+                <label class="sdxbr-batch-doc" title="${escapeHtml([d.name, d.desc, d.step, d.workflow].filter(Boolean).join(" | "))}">
+                    <input type="checkbox" class="sdxbr-batch-include" data-id="${escapeHtml(d.id)}" ${d.include ? "checked" : ""}>
+                    <span class="sdxbr-batch-doc-name">${escapeHtml(d.name)}</span>
+                    <span class="sdxbr-batch-doc-meta">${escapeHtml([d.desc, d.step].filter(Boolean).join(" - "))}</span>
+                    <span class="sdxbr-pill" title="${escapeHtml(names)}">${escapeHtml(count)}</span>
+                </label>`;
+        }).join("");
+        const resultsHtml = state.batch.results ? `
+            <div class="sdxbr-batch-section-title" style="margin-top:10px;">Last run</div>
+            ${state.batch.results.map(r => {
+                const lines = [];
+                if (r.added.length) lines.push(`<div class="sdxbr-batch-ok">Added: ${escapeHtml(r.added.map(getUserName).join(", "))}</div>`);
+                if (r.skipped.length) lines.push(`<div class="sdxbr-muted">Already had: ${escapeHtml(r.skipped.map(getUserName).join(", "))}</div>`);
+                if (r.failed.length) {
+                    const reason = String(r.failed[0].error && r.failed[0].error.message || "unknown error").slice(0, 140);
+                    lines.push(`<div class="sdxbr-batch-fail">Failed: ${escapeHtml(r.failed.map(f => getUserName(f.user)).join(", "))} - ${escapeHtml(reason)}</div>`);
+                }
+                if (!lines.length) lines.push(`<div class="sdxbr-muted">Nothing to do.</div>`);
+                return `<div class="sdxbr-batch-result"><strong>${escapeHtml(r.doc.name)}</strong>${lines.join("")}</div>`;
+            }).join("")}
+            ${state.batch.results.some(r => r.failed.length) && state.queued.size ? `<button type="button" class="sdxbr-btn sdxbr-primary" id="sdxbrBatchRetry" style="margin-top:6px;">Retry failed</button>` : ""}
+        ` : "";
+        const sharedHtml = everyone.length
+            ? everyone.map(chip).join("")
+            : `<span class="sdxbr-muted">${ready ? "No one is on every included document." : "Loading..."}</span>`;
+        const partialHtml = partial.length
+            ? partial.map(c => `<span class="sdxbr-chip sdxbr-chip-partial" title="${escapeHtml(c.docs.map(d => d.name).join(", "))}">${escapeHtml(c.user.DisplayName || c.user.OBID)} (${c.docs.length}/${included.length})</span>`).join("")
+            : `<span class="sdxbr-muted">${ready ? "No one is on only some of the documents." : "Loading..."}</span>`;
+        container.innerHTML = `
+            ${skippedNote}
+            <div class="sdxbr-batch-grid">
+                <div class="sdxbr-batch-col">
+                    <div class="sdxbr-batch-col-title">
+                        <span>Documents (${included.length}/${docs.length})</span>
+                        <span class="sdxbr-batch-col-actions">
+                            <button type="button" class="sdxbr-mini-btn" id="sdxbrBatchAll">All</button>
+                            <button type="button" class="sdxbr-mini-btn" id="sdxbrBatchNone">None</button>
+                        </span>
+                    </div>
+                    <div class="sdxbr-batch-col-body">${docRows}</div>
+                </div>
+                <div class="sdxbr-batch-col">
+                    <div class="sdxbr-batch-col-title"><span>Shared - on every document</span><span class="sdxbr-pill">${everyone.length}</span></div>
+                    <div class="sdxbr-batch-col-body">${sharedHtml}</div>
+                </div>
+                <div class="sdxbr-batch-col">
+                    <div class="sdxbr-batch-col-title"><span>Unique - only some documents</span><span class="sdxbr-pill">${partial.length}</span></div>
+                    <div class="sdxbr-batch-col-body">${partialHtml}</div>
+                </div>
+            </div>
+            ${resultsHtml}
+        `;
+        container.querySelectorAll(".sdxbr-batch-include").forEach(cb => {
+            cb.addEventListener("change", () => {
+                const doc = state.batch.docs.find(d => d.id === cb.dataset.id);
+                if (!doc) return;
+                doc.include = cb.checked;
+                applyBatchContext();
+                recomputeBatchExisting();
+                renderBatchDependents();
+                if (cb.checked) loadBatchExisting(false);
+            });
+        });
+        const setAll = value => {
+            state.batch.docs.forEach(d => { d.include = value; });
+            applyBatchContext();
+            recomputeBatchExisting();
+            renderBatchDependents();
+            if (value) loadBatchExisting(false);
+        };
+        document.getElementById("sdxbrBatchAll")?.addEventListener("click", () => setAll(true));
+        document.getElementById("sdxbrBatchNone")?.addEventListener("click", () => setAll(false));
+        document.getElementById("sdxbrBatchRetry")?.addEventListener("click", () => addQueuedReviewers());
+    }
+    function updateModalHeader() {
+        const titleEl = document.getElementById("sdxbrTitle");
+        const subtitleEl = document.getElementById("sdxbrSubtitle");
+        if (titleEl && subtitleEl) {
+            if (state.batch.active) {
+                titleEl.textContent = `${WIZARD_ICON} ${TOOL_NAME} - Batch`;
+                subtitleEl.textContent = `v${VERSION} | Adding to ${includedBatchDocs().length} of ${state.batch.docs.length} selected documents | Project ${state.projectKey}`;
+            } else {
+                titleEl.textContent = `${WIZARD_ICON} ${TOOL_NAME}`;
+                subtitleEl.textContent = `v${VERSION} | Per-project database | Favorites | Zero-click context`;
+            }
+        }
+        const addBtn = document.getElementById("sdxbrAddReviewers");
+        if (addBtn) {
+            addBtn.textContent = state.batch.active
+                ? `Add to ${includedBatchDocs().length} document${includedBatchDocs().length === 1 ? "" : "s"}`
+                : "Add Reviewers";
+        }
     }
     /************************************************************
      * UI
@@ -1578,6 +2211,122 @@
         `;
         document.head.appendChild(style);
     }
+    function installBatchStyles() {
+        const id = IDS.style + "_batch";
+        if (document.getElementById(id)) return;
+        const style = document.createElement("style");
+        style.id = id;
+        style.textContent = `
+            .sdxbr-batch-btn {
+                height: 30px;
+                padding: 0 13px;
+                margin-left: 8px;
+                border-radius: 15px;
+                border: 1px solid #0f6cbd;
+                background: linear-gradient(180deg, #0f6cbd, #075a9c);
+                color: #fff;
+                font-family: "Segoe UI", Arial, sans-serif;
+                font-size: 12px;
+                font-weight: 700;
+                cursor: pointer;
+                vertical-align: middle;
+                white-space: nowrap;
+            }
+            .sdxbr-batch-btn:hover {
+                background: linear-gradient(180deg, #1683df, #0f6cbd);
+            }
+            #${IDS.modal} .sdxbr-batch-section-title {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                font-size: 12px;
+                font-weight: 700;
+                margin: 4px 0;
+            }
+            #${IDS.modal} .sdxbr-existing-body.sdxbr-batch-body {
+                max-height: none;
+                overflow: visible;
+                min-height: 0;
+            }
+            #${IDS.modal} .sdxbr-batch-grid {
+                display: grid;
+                grid-template-columns: 1.5fr 1fr 1fr;
+                gap: 10px;
+            }
+            #${IDS.modal} .sdxbr-batch-col {
+                border: 1px solid #d8dee6;
+                border-radius: 6px;
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+            }
+            #${IDS.modal} .sdxbr-batch-col-title {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 6px;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: 700;
+                background: #f3f6fa;
+                border-bottom: 1px solid #d8dee6;
+                border-radius: 6px 6px 0 0;
+            }
+            #${IDS.modal} .sdxbr-batch-col-actions {
+                display: flex;
+                flex-direction: row;
+                flex-wrap: nowrap;
+                gap: 6px;
+                flex: 0 0 auto;
+            }
+            #${IDS.modal} .sdxbr-batch-col-actions .sdxbr-mini-btn {
+                width: auto;
+                height: auto;
+                padding: 2px 8px;
+                white-space: nowrap;
+            }
+            #${IDS.modal} .sdxbr-batch-doc .sdxbr-pill {
+                flex: 0 0 auto;
+                white-space: nowrap;
+            }
+            #${IDS.modal} .sdxbr-batch-col-body {
+                height: 230px;
+                overflow: auto;
+                padding: 4px 6px;
+            }
+            #${IDS.modal} .sdxbr-batch-doc {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 3px 0;
+                font-size: 12px;
+                cursor: pointer;
+                border-bottom: 1px solid #f0f2f5;
+            }
+            #${IDS.modal} .sdxbr-batch-doc:last-child { border-bottom: none; }
+            #${IDS.modal} .sdxbr-batch-doc-name { font-weight: 700; white-space: nowrap; }
+            #${IDS.modal} .sdxbr-batch-doc-meta {
+                flex: 1 1 auto;
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                color: #666;
+            }
+            #${IDS.modal} .sdxbr-chip-partial {
+                background: #fff8e1;
+                border-color: #f0d98a;
+            }
+            #${IDS.modal} .sdxbr-batch-result {
+                font-size: 12px;
+                padding: 4px 0;
+                border-bottom: 1px solid #f0f2f5;
+            }
+            #${IDS.modal} .sdxbr-batch-ok { color: #1e6b2a; }
+            #${IDS.modal} .sdxbr-batch-fail { color: #b00020; }
+        `;
+        document.head.appendChild(style);
+    }
     function buildDockedButtonEl(page) {
         const btn = document.createElement("button");
         btn.id = IDS.button;
@@ -1603,7 +2352,7 @@
         }
         removeDockedButton();
         if (!desired) {
-            if (isModalOpen()) closeModal();
+            if (isModalOpen() && !state.batch.active) closeModal();
             return;
         }
         if (desired === "add-recipient") {
@@ -1629,8 +2378,8 @@
         modal.innerHTML = `
             <div class="sdxbr-header">
                 <div>
-                    <div class="sdxbr-title">${WIZARD_ICON} ${TOOL_NAME}</div>
-                    <div class="sdxbr-subtitle">v${VERSION} | Per-project database | Favorites | Zero-click context</div>
+                    <div class="sdxbr-title" id="sdxbrTitle">${WIZARD_ICON} ${TOOL_NAME}</div>
+                    <div class="sdxbr-subtitle" id="sdxbrSubtitle">v${VERSION} | Per-project database | Favorites | Zero-click context</div>
                 </div>
                 <div class="sdxbr-header-right">
                     <span class="sdxbr-session-pill missing" id="sdxbrSessionPill">Session not captured yet</span>
@@ -1668,6 +2417,7 @@
         return Boolean(document.getElementById(IDS.modal)?.classList.contains("open"));
     }
     function openModal() {
+        state.batch.active = false;
         loadStoredState();
         installModal();
         document.getElementById(IDS.backdrop)?.classList.add("open");
@@ -1681,6 +2431,14 @@
     function closeModal() {
         document.getElementById(IDS.backdrop)?.classList.remove("open");
         document.getElementById(IDS.modal)?.classList.remove("open");
+        if (state.batch.active) {
+            state.batch.active = false;
+            state.batch.results = null;
+            state.existingRecipients = new Map();
+            state.existingRecipientsStatus = "idle";
+            state.batch.lastChecked = -1;
+            updateModalHeader();
+        }
     }
     function switchTab(tab) {
         state.activeTab = tab;
@@ -1768,9 +2526,14 @@
             setStatus("Reviewer database is ready, but this document's Add Recipients context is missing. Try reopening the tool here.", true);
             return;
         }
+        if (state.batch.active) {
+            setStatus(`Ready. Cached users: ${state.userCache.size}. Adding to ${includedBatchDocs().length} of ${state.batch.docs.length} selected documents.`);
+            return;
+        }
         setStatus(`Ready. Cached users: ${state.userCache.size}. Workflow step: ${state.addTemplate.workFlowStepOBIDs.join(", ")}.`);
     }
     function renderAll() {
+        updateModalHeader();
         renderReviewersTab();
         renderDatabaseTab();
         renderContextPanel();
@@ -1797,13 +2560,13 @@
             </div>` : ""}
             <div class="sdxbr-panel" style="margin-bottom:12px;">
                 <div class="sdxbr-panel-title">
-                    <span>Already On This Document</span>
+                    <span>${state.batch.active ? "Selected Documents" : "Already On This Document"}</span>
                     <div style="display:flex; gap:8px; align-items:center;">
                         <span class="sdxbr-existing-status" id="sdxbrExistingStatus">Not loaded yet.</span>
                         <button type="button" class="sdxbr-mini-btn" id="sdxbrRefreshExisting">Refresh</button>
                     </div>
                 </div>
-                <div class="sdxbr-panel-body sdxbr-existing-body" id="sdxbrExisting" style="padding:8px;"></div>
+                <div class="sdxbr-panel-body sdxbr-existing-body ${state.batch.active ? "sdxbr-batch-body" : ""}" id="sdxbrExisting" style="padding:8px;"></div>
             </div>
             <div class="sdxbr-toolbar" style="grid-template-columns: 1fr; margin-bottom:12px;">
                 <input id="sdxbrSearch" type="text" placeholder="Search cached reviewers by name, login, email, organization, or Id - typos OK">
@@ -1957,7 +2720,7 @@
         if (!pane) return;
         const workflow = state.addTemplate.workFlowStepOBIDs.length
             ? state.addTemplate.workFlowStepOBIDs.join(", ")
-            : "Not captured";
+            : (state.batch.active ? "No documents included" : "Not captured");
         pane.innerHTML = `
             <div class="sdxbr-note">
                 Debug info only - not needed for normal use. Workflow context is derived directly from this
@@ -2130,6 +2893,10 @@
     function renderExistingRecipients() {
         const container = document.getElementById("sdxbrExisting");
         const statusEl = document.getElementById("sdxbrExistingStatus");
+        if (state.batch.active) {
+            if (container) renderBatchPanel(container, statusEl);
+            return;
+        }
         if (statusEl) {
             const map = {
                 idle: "Not loaded yet.",
@@ -2202,7 +2969,15 @@
             return;
         }
         const currentHref = location.href;
-        if (currentHref !== state.lastHref) {
+        if (state.batch.active && !isTodoListPage()) {
+            // Navigated away from the To Do List while the batch window was open.
+            closeModal();
+        }
+        if (currentHref !== state.lastHref && state.batch.active) {
+            // Batch mode owns projectKey/context while its window is open; the To
+            // Do List URL changing (filters, sorting) must not clobber it.
+            state.lastHref = currentHref;
+        } else if (currentHref !== state.lastHref) {
             state.lastHref = currentHref;
             const oldProject = state.projectKey;
             const oldPage = state.pageKey;
@@ -2227,7 +3002,9 @@
         // Cheap and idempotent - must run every tick regardless of whether the
         // URL changed, so the button can appear once its anchor finally mounts.
         installStyles();
+        installBatchStyles();
         ensureDockedButton();
+        ensureBatchButton();
     }
     function monitorNavigation() {
         const originalPushState = history.pushState;
@@ -2246,8 +3023,18 @@
         window.addEventListener("popstate", () => setTimeout(activateIfNeeded, 300));
         setInterval(activateIfNeeded, 1500);
     }
+    // Update the batch button promptly when To Do List rows are (un)checked;
+    // the 1.5s tick in activateIfNeeded() is the safety net (e.g. select-all).
+    for (const evt of ["click", "change"]) {
+        document.addEventListener(evt, e => {
+            if (e.target && e.target.closest && e.target.closest(TODO_CHECKBOX_SELECTOR)) {
+                setTimeout(ensureBatchButton, 60);
+            }
+        }, true);
+    }
     installNetworkHooks();
     loadStoredState();
     monitorNavigation();
     activateIfNeeded();
 })();
+ 

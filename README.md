@@ -29,3 +29,13 @@ Once the user adds someone to the "queue" they'll show up in D. They can queue u
 When ready, user can click on "Add reviewers". The process is then limited to SDx's backend, so it'll take about 3 seconds per person to add. 
 
 Once done, user will be prompted to refresh the page to confirm new reviewers were added. 
+
+
+v1.3 added Batch Addition within To-do list:
+
+In the to-do list, select any set of documents open for review, and a new button will pop up "Batch Add reviewers". This will show you the common reviewers between the documents and then unique reviewers. 
+Then you can queue any reviewers that will be added to all selected documents. 
+
+<img width="2531" height="1187" alt="image" src="https://github.com/user-attachments/assets/c5c57d4e-31fe-4917-b031-3fe1e7ea66aa" />
+
+

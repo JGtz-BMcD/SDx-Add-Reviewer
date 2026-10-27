@@ -1,27 +1,103 @@
 // ==UserScript==
 // @name         Reviewer Wizard
-// @namespace    https://burnsmcd.com
-// @version      1.3
-// @author       Josue Gutierrez
+// @namespace    http://tampermonkey.net/
+// @version      1.4
 // @description  Per-project reviewer wizard for SDx: fast fuzzy search, favorites, existing-recipient awareness, batched bulk add, and batch add to multiple To Do List documents.
 // @match        https://*/enr01/*
 // @match        https://*/ENR01/*
 // @grant        none
-// @downloadURL https://raw.githubusercontent.com/JGtz-BMcD/SDx-Add-Reviewer/main/SDx-Add-Reviewer.user.js
-// @updateURL https://raw.githubusercontent.com/JGtz-BMcD/SDx-Add-Reviewer/main/SDx-Add-Reviewer.user.js
 // ==/UserScript==
 (function () {
     "use strict";
-    const VERSION = "1.3";
+    /************************************************************
+     * Toolbar companion (runs in same-origin FRAMES only)
+     *
+     * The review page keeps the PDF viewer and its toolbar (the row holding
+     * "Prev Doc Ver", Export/Import Bluebeam, ...) inside nested frames, which
+     * the top page can't reach into. Same approach as the Previous Version
+     * Finder script: a tiny copy of this script runs inside the frame, adds a
+     * button to that toolbar row, and tells the top window (postMessage,
+     * origin-checked, plain data only) when it's clicked. The real wizard only
+     * ever lives in the top window. Self-contained on purpose - it runs before
+     * the rest of this file has initialized.
+     ************************************************************/
+    function startToolbarCompanion() {
+        const BTN_ID = "sdxbr_toolbar_btn_v14";
+        const PREV_BTN_ID = "sdx-prevsub-btn"; // the Previous Version Finder's button
+        let show = false;
+        const post = msg => {
+            try { window.top.postMessage(Object.assign({ sdxbr: true }, msg), location.origin); } catch {}
+        };
+        function walkDocs(doc, fn, depth) {
+            if (!doc || depth > 6) return null;
+            let hit = null;
+            try { hit = fn(doc); } catch { hit = null; }
+            if (hit) return hit;
+            let frames = [];
+            try { frames = Array.from(doc.querySelectorAll("iframe")); } catch { frames = []; }
+            for (const f of frames) {
+                let child = null;
+                try { child = f.contentDocument; } catch { child = null; }
+                const r = walkDocs(child, fn, depth + 1);
+                if (r) return r;
+            }
+            return null;
+        }
+        const findContainer = () => walkDocs(document, d => d.querySelector(".custom-ribbons-container"), 0);
+        function buildButton(doc) {
+            const b = doc.createElement("button");
+            b.type = "button";
+            b.id = BTN_ID;
+            b.textContent = "Reviewer Wizard";
+            b.title = "Add reviewers to this document";
+            b.style.cssText = "height:28px;padding:0 12px;margin:0 10px 0 0;border-radius:14px;border:1px solid #0f6cbd;background:#0f6cbd;color:#fff;font:700 12px 'Segoe UI',Arial,sans-serif;cursor:pointer;white-space:nowrap;flex:0 0 auto;";
+            b.addEventListener("click", () => post({ type: "open" }));
+            return b;
+        }
+        setInterval(() => {
+            try {
+                const c = findContainer();
+                let el = c ? c.querySelector("#" + BTN_ID) : null;
+                if (c && show && !el) {
+                    el = buildButton(c.ownerDocument);
+                    // Sit directly LEFT of the Previous Version button when it's
+                    // there (so it stays right of Bluebeam and neither script
+                    // keeps re-ordering the other); otherwise at the end.
+                    const prev = c.querySelector("#" + PREV_BTN_ID);
+                    if (prev) prev.insertAdjacentElement("beforebegin", el);
+                    else c.appendChild(el);
+                }
+                if (el && !show) { el.remove(); el = null; }
+                let visible = false;
+                if (el) {
+                    const r = el.getBoundingClientRect();
+                    visible = r.width > 0 && r.height > 0;
+                }
+                post({ type: "hello", placed: visible });
+            } catch {}
+        }, 1000);
+        window.addEventListener("message", e => {
+            if (e.origin !== location.origin || e.source !== window.top) return;
+            const d = e.data;
+            if (d && d.sdxbr === true && d.type === "state") show = Boolean(d.show);
+        });
+    }
+    if (window.top !== window.self) {
+        let sameOriginAsTop = false;
+        try { sameOriginAsTop = Boolean(window.top.location.href); } catch {}
+        if (sameOriginAsTop) startToolbarCompanion();
+        return; // the full wizard only runs in the top window
+    }
+    const VERSION = "1.4";
     const TOOL_NAME = "Reviewer Wizard";
     const WIZARD_ICON = "\u{1FA84}"; // magic wand
     const PAGE_SIZE = 100;
     const DEFAULT_SELECTED_ORGS = ["Burns & McDonnell"];
     const IDS = {
-        style: "sdxbr_style_v13",
-        button: "sdxbr_button_v13",
-        modal: "sdxbr_modal_v13",
-        backdrop: "sdxbr_backdrop_v13"
+        style: "sdxbr_style_v14",
+        button: "sdxbr_button_v14",
+        modal: "sdxbr_modal_v14",
+        backdrop: "sdxbr_backdrop_v14"
     };
     // Storage keys are unchanged from v0.7 on purpose - this release is UI/perf
     // tweaks only, so existing per-project databases, favorites, and recents all
@@ -36,7 +112,7 @@
         pageContextPrefix: "sdxbr_page_context_v07_",
         lastAddTemplatePrefix: "sdxbr_last_add_template_v13_"
     };
-    const BATCH_BTN_ID = "sdxbr_batch_button_v13";
+    const BATCH_BTN_ID = "sdxbr_batch_button_v14";
     const TODO_CHECKBOX_SELECTOR = 'input[type="checkbox"].mdc-checkbox__native-control';
     const state = {
         hooksInstalled: false,
@@ -69,6 +145,10 @@
         authStale: false,
         busy: false,
         dbBusy: false,
+        searchText: "",
+        // Toolbar companion (review viewer route): whether the button was placed
+        // in the viewer toolbar, and when this route was entered.
+        toolbar: { placed: false, helloAt: 0, routeSince: Date.now() },
         // Batch mode (To Do List): add the same reviewers to several selected
         // workflow steps at once. `existing` is docId -> { status, users }.
         batch: {
@@ -160,8 +240,19 @@
     function isReviewPage() {
         return hashRouteIs("review");
     }
+    // The reviewer pane has moved between routes across SDx releases: the
+    // classic #/viewAndMarkup, and the newer extensibility host
+    // #/external;...;MethodName=BMcD_PerformConsolidation (or another
+    // review-style method). Both host the PDF viewer + Bluebeam toolbar in
+    // nested frames, so the wizard button is placed by the toolbar companion.
+    function isReviewViewerRoute() {
+        let href = location.href;
+        try { href = decodeURIComponent(href); } catch {}
+        if (/#\/viewAndMarkup(?:;|$)/i.test(href)) return true;
+        return /#\/external;/i.test(href) && /MethodName=[^;]*(consolidat|review)/i.test(href);
+    }
     function isDocumentPage() {
-        return isAddRecipientPage() || isReviewPage();
+        return isAddRecipientPage() || isReviewPage() || isReviewViewerRoute();
     }
     function isSdxPage() {
         return location.href.toLowerCase().includes("/enr01/");
@@ -488,6 +579,20 @@
                 }
             }
         } catch {}
+        if (found.length) return found;
+        // Nothing under an "auth" key: widen the search (ported from the
+        // Previous Version Finder) to any storage value or cookie holding a JWT.
+        try {
+            for (const store of [sessionStorage, localStorage]) {
+                for (let i = 0; i < store.length; i++) {
+                    const value = store.getItem(store.key(i)) || "";
+                    const m = value.match(/\b(eyJ[A-Za-z0-9_\-.]+)\b/);
+                    if (m && looksLikeJwt(m[1])) found.push(m[1]);
+                }
+            }
+            const cm = (document.cookie || "").match(/\b(eyJ[A-Za-z0-9_\-.]+)\b/);
+            if (cm && looksLikeJwt(cm[1])) found.push(cm[1]);
+        } catch {}
         return found;
     }
     // Returns "Bearer <token>". Normal use: keep the captured token unless it is
@@ -707,9 +812,9 @@
         }
     }
     function installNetworkHooks() {
-        if (state.hooksInstalled || window.__sdxbr_v13_hooks) return;
+        if (state.hooksInstalled || window.__sdxbr_v14_hooks) return;
         state.hooksInstalled = true;
-        window.__sdxbr_v13_hooks = true;
+        window.__sdxbr_v14_hooks = true;
         const originalFetch = window.fetch;
         window.fetch = async function (...args) {
             const info = getFetchInfo(args);
@@ -733,21 +838,21 @@
         const originalSend = XMLHttpRequest.prototype.send;
         const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
         XMLHttpRequest.prototype.open = function (method, url) {
-            this.__sdxbr_v13_url = url;
-            this.__sdxbr_v13_headers = {};
+            this.__sdxbr_v14_url = url;
+            this.__sdxbr_v14_headers = {};
             return originalOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.setRequestHeader = function (key, value) {
             try {
-                this.__sdxbr_v13_headers[String(key).toLowerCase()] = value;
+                this.__sdxbr_v14_headers[String(key).toLowerCase()] = value;
             } catch {}
             return originalSetHeader.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function (body) {
             try {
-                const url = this.__sdxbr_v13_url || "";
+                const url = this.__sdxbr_v14_url || "";
                 if (isCandidateSdxApiUrl(url)) {
-                    rememberHeaders(this.__sdxbr_v13_headers);
+                    rememberHeaders(this.__sdxbr_v14_headers);
                 }
                 const lower = String(url).toLowerCase();
                 if (lower.includes("/api/v2/sda/getusersforworkflowsteps")) {
@@ -800,6 +905,7 @@
         state.queued.clear();
         state.addedThisPage.clear();
         state.searchResults = [];
+        state.searchText = "";
         state.addEndpoint = null;
         state.lastWorkflowSearchUrl = null;
         state.lastWorkflowSearchParams = null;
@@ -1250,6 +1356,47 @@
         return true;
     }
     /************************************************************
+     * Review viewer toolbar button (placed by the frame companion above)
+     ************************************************************/
+    const FALLBACK_BTN_ID = "sdxbr_fallback_button_v14";
+    function toggleWizardFromToolbar() {
+        if (isModalOpen() && !state.batch.active) closeModal();
+        else openModal();
+    }
+    window.addEventListener("message", e => {
+        if (e.origin !== location.origin || e.source === window) return;
+        const d = e.data;
+        if (!d || d.sdxbr !== true) return;
+        if (d.type === "hello") {
+            state.toolbar.helloAt = Date.now();
+            state.toolbar.placed = Boolean(d.placed);
+            try { e.source.postMessage({ sdxbr: true, type: "state", show: isReviewViewerRoute() }, e.origin); } catch {}
+        } else if (d.type === "open" && isReviewViewerRoute()) {
+            toggleWizardFromToolbar();
+        }
+    });
+    // Safety net: if the toolbar button hasn't appeared 15s after opening a
+    // review viewer page (frame not reachable, toolbar renamed...), show a
+    // small floating button instead so the wizard is never unreachable.
+    function ensureToolbarFallback() {
+        const existing = document.getElementById(FALLBACK_BTN_ID);
+        const placedNow = state.toolbar.placed && Date.now() - state.toolbar.helloAt < 4000;
+        const want = isReviewViewerRoute() && !placedNow && Date.now() - state.toolbar.routeSince > 15000;
+        if (!want) {
+            existing?.remove();
+            return;
+        }
+        if (existing || !document.body) return;
+        const btn = document.createElement("button");
+        btn.id = FALLBACK_BTN_ID;
+        btn.type = "button";
+        btn.className = "sdxbr-docked";
+        btn.style.cssText = "position:fixed;right:150px;bottom:22px;z-index:999997;margin:0;";
+        btn.textContent = `${WIZARD_ICON} ${TOOL_NAME}`;
+        btn.addEventListener("click", toggleWizardFromToolbar);
+        document.body.appendChild(btn);
+    }
+    /************************************************************
      * Batch mode (To Do List): add the same reviewers to many documents
      ************************************************************/
     // Confirmed from a live To Do row: each row is an SPFWorkflowStep whose OBID
@@ -1407,6 +1554,7 @@
         updateStatus();
         updateSessionIndicator();
         loadBatchExisting(false);
+        setTimeout(() => document.getElementById("sdxbrSearch")?.focus(), 80);
     }
     async function loadBatchDocExisting(doc, map) {
         const entry = { status: "loading", users: new Map() };
@@ -2235,6 +2383,34 @@
             .sdxbr-batch-btn:hover {
                 background: linear-gradient(180deg, #1683df, #0f6cbd);
             }
+            #${IDS.modal} .sdxbr-searchbox {
+                background: linear-gradient(180deg, #e3f0fc, #d3e7fa);
+                border: 2px solid #0f6cbd;
+                border-radius: 10px;
+                padding: 10px 14px 12px;
+                margin-bottom: 14px;
+                box-shadow: 0 2px 8px rgba(15,108,189,0.18);
+            }
+            #${IDS.modal} .sdxbr-searchbox-label {
+                display: block;
+                font-size: 12px;
+                font-weight: 700;
+                letter-spacing: 0.3px;
+                color: #0b4f8a;
+                margin-bottom: 6px;
+            }
+            #${IDS.modal} .sdxbr-searchbox input[type="text"] {
+                height: 42px;
+                font-size: 15px;
+                border: 2px solid #0f6cbd;
+                border-radius: 8px;
+                background: #fff;
+                padding: 0 14px;
+            }
+            #${IDS.modal} .sdxbr-searchbox input[type="text"]:focus {
+                border-color: #075a9c;
+                box-shadow: 0 0 0 4px rgba(15,108,189,0.28);
+            }
             #${IDS.modal} .sdxbr-batch-section-title {
                 display: flex;
                 justify-content: space-between;
@@ -2352,7 +2528,9 @@
         }
         removeDockedButton();
         if (!desired) {
-            if (isModalOpen() && !state.batch.active) closeModal();
+            // Keep the window open on the review viewer routes (their button lives
+            // in the viewer toolbar, not here) and during batch mode.
+            if (isModalOpen() && !state.batch.active && !isReviewViewerRoute()) closeModal();
             return;
         }
         if (desired === "add-recipient") {
@@ -2427,6 +2605,7 @@
         updateStatus();
         updateSessionIndicator();
         loadExistingRecipients();
+        setTimeout(() => document.getElementById("sdxbrSearch")?.focus(), 80);
     }
     function closeModal() {
         document.getElementById(IDS.backdrop)?.classList.remove("open");
@@ -2547,6 +2726,10 @@
     function renderReviewersTab() {
         const pane = document.getElementById("sdxbrReviewersPane");
         if (!pane) return;
+        const prevSearch = document.getElementById("sdxbrSearch");
+        const hadSearchFocus = Boolean(prevSearch && document.activeElement === prevSearch);
+        const caretStart = prevSearch ? prevSearch.selectionStart : 0;
+        const caretEnd = prevSearch ? prevSearch.selectionEnd : 0;
         pane.innerHTML = `
             ${!state.userCache.size ? `
             <div class="sdxbr-note" style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
@@ -2568,8 +2751,9 @@
                 </div>
                 <div class="sdxbr-panel-body sdxbr-existing-body ${state.batch.active ? "sdxbr-batch-body" : ""}" id="sdxbrExisting" style="padding:8px;"></div>
             </div>
-            <div class="sdxbr-toolbar" style="grid-template-columns: 1fr; margin-bottom:12px;">
-                <input id="sdxbrSearch" type="text" placeholder="Search cached reviewers by name, login, email, organization, or Id - typos OK">
+            <div class="sdxbr-searchbox">
+                <label for="sdxbrSearch" class="sdxbr-searchbox-label">&#128269; Find a reviewer</label>
+                <input id="sdxbrSearch" type="text" autocomplete="off" placeholder="Type a name, login, email, organization, or Id - typos OK">
             </div>
             <div class="sdxbr-workspace">
                 <div class="sdxbr-sidebar">
@@ -2616,9 +2800,19 @@
                 </div>
             </div>
         `;
-        document.getElementById("sdxbrSearch").addEventListener("input", debounce(e => {
-            searchCachedUsers(e.target.value);
-        }, 150));
+        const searchInput = document.getElementById("sdxbrSearch");
+        // The pane is rebuilt on every render, so carry the typed text (and focus)
+        // across rebuilds instead of silently clearing the box.
+        searchInput.value = state.searchText || "";
+        if (hadSearchFocus) {
+            searchInput.focus();
+            try { searchInput.setSelectionRange(caretStart, caretEnd); } catch {}
+        }
+        const runSearch = debounce(value => searchCachedUsers(value), 150);
+        searchInput.addEventListener("input", e => {
+            state.searchText = e.target.value;
+            runSearch(e.target.value);
+        });
         document.getElementById("sdxbrRefreshExisting").addEventListener("click", () => loadExistingRecipients());
         document.getElementById("sdxbrRefreshPageBtn")?.addEventListener("click", () => location.reload());
         document.getElementById("sdxbrGoBuildDb")?.addEventListener("click", () => switchTab("database"));
@@ -2969,6 +3163,7 @@
             return;
         }
         const currentHref = location.href;
+        if (currentHref !== state.lastHref) state.toolbar.routeSince = Date.now();
         if (state.batch.active && !isTodoListPage()) {
             // Navigated away from the To Do List while the batch window was open.
             closeModal();
@@ -3005,6 +3200,7 @@
         installBatchStyles();
         ensureDockedButton();
         ensureBatchButton();
+        ensureToolbarFallback();
     }
     function monitorNavigation() {
         const originalPushState = history.pushState;
@@ -3037,4 +3233,3 @@
     monitorNavigation();
     activateIfNeeded();
 })();
- 
